@@ -745,3 +745,897 @@ Next milestone adalah **RADIUS Authentication**, kemudian **RADIUS Accounting**.
 Local authentication tetap dipertahankan sebagai baseline test agar setiap perubahan dapat dibandingkan dengan konfigurasi yang sudah terbukti bekerja.
 
 > Dokumentasi ini adalah catatan lab dan pembelajaran. Konfigurasi production wajib melalui validasi, security review, resource sizing, monitoring, backup, dan failure testing terlebih dahulu.
+
+
+---
+
+# 15. Panduan Lengkap untuk Pembaca Baru
+
+Bagian ini sengaja dibuat lebih detail daripada quick-start. Tujuannya supaya orang yang belum mengenal BNG, VPP, FRR, atau OSVBNG tetap bisa mengikuti lab dari awal.
+
+## 15.1 Sebelum mulai: pahami tiga jalur
+
+Di lab ini ada tiga jalur yang berbeda:
+
+### Jalur ACCESS
+
+~~~
+MikroTik
+   |
+   | PPPoE + VLAN 100
+   v
+ens4
+   |
+br-eth0
+   |
+veth-eth0
+   |
+eth0
+   |
+VPP / OSVBNG
+~~~
+
+### Jalur CORE
+
+~~~
+Core router
+10.0.0.1/30
+     |
+    ens3
+     |
+  br-eth1
+     |
+ veth-eth1
+     |
+   eth1
+     |
+ OSVBNG
+10.0.0.2/30
+~~~
+
+### Jalur control/management
+
+OSVBNG memiliki CLI/API untuk mengontrol subscriber dan service.
+
+Di lab, API Unix Domain Socket:
+
+~~~
+/run/osvbng/api.sock
+~~~
+
+---
+
+# 16. Full Installation Docker dari Nol
+
+## 16.1 Siapkan directory
+
+~~~
+sudo mkdir -p /opt/osvbng
+cd /opt/osvbng
+~~~
+
+## 16.2 Pastikan disk cukup
+
+~~~
+df -h /
+~~~
+
+Untuk lab kecil, gunakan disk minimal sekitar 10 GB agar image Docker, logs, package cache, dan file temporary tidak cepat memenuhi filesystem.
+
+## 16.3 Pastikan memory
+
+~~~
+free -h
+~~~
+
+Jika VM hanya 2 GiB RAM, gunakan swap dan jangan langsung mengaktifkan seluruh routing stack.
+
+## 16.4 Siapkan konfigurasi utama
+
+Buat:
+
+~~~
+/opt/osvbng/osvbng.yaml
+~~~
+
+Isi lengkap:
+
+~~~yaml
+subscriber-groups:
+  groups:
+    residential:
+      vlan-tpid: dot1q
+      ipv4-profile: residential-v4
+      vlans:
+        - svlan: "100"
+          cvlan: any
+          interface: loop100
+          parent-interface: eth0
+          access-types:
+            - pppoe
+      aaa-policy: pppoe-policy
+
+ipv4-profiles:
+  residential-v4:
+    gateway: 10.255.0.1
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    pools:
+      - name: subscriber-pool
+        network: 10.255.0.0/16
+        priority: 1
+    dhcp:
+      lease-time: 3600
+
+dhcp:
+  provider: local
+
+interfaces:
+  loop0:
+    description: Control Plane Loopback
+    enabled: true
+    address:
+      ipv4:
+        - 10.254.0.1/32
+
+  eth0:
+    description: Access Interface
+    enabled: true
+
+  eth1:
+    description: Core Interface
+    enabled: true
+    lcp: true
+    address:
+      ipv4:
+        - 10.0.0.2/30
+
+  loop100:
+    description: Subscriber Gateway Loopback
+    enabled: true
+    lcp: true
+    address:
+      ipv4:
+        - 10.255.0.1/32
+
+aaa:
+  auth_provider: local
+  nas_identifier: osvbng
+  policy:
+    - name: pppoe-policy
+      type: ppp
+      format: $agent-remote-id$
+      authenticate: true
+      max_concurrent_sessions: 1
+
+plugins:
+  northbound.api:
+    enabled: true
+    listeners:
+      - address: ":8080"
+    uds:
+      enabled: true
+      path: /run/osvbng/api.sock
+      mode: "0660"
+      group: osvbng
+
+  subscriber.auth.local:
+    allow_all: false
+    database_path: /tmp/osvbng.db
+
+  exporter.prometheus:
+    enabled: false
+    listen_address: ":9090"
+
+logging:
+  format: text
+  level: info
+
+dataplane:
+  lcp-netns: dataplane
+~~~
+
+## 16.5 Mengapa access-types harus berada di VLAN range?
+
+Untuk PPPoE pada OSVBNG v0.16.0, access type untuk protocol non-LNS harus didefinisikan pada VLAN range.
+
+Yang benar:
+
+~~~yaml
+vlans:
+  - svlan: "100"
+    cvlan: any
+    interface: loop100
+    parent-interface: eth0
+    access-types:
+      - pppoe
+~~~
+
+Bukan menaruh access-types PPPoE hanya pada level group.
+
+Ini penting karena validator konfigurasi memeriksa access type berdasarkan VLAN range.
+
+## 16.6 Buat routing-daemons.tmpl minimal
+
+~~~
+cat > /opt/osvbng/routing-daemons.tmpl <<'EOF'
+bgpd=no
+ospfd=no
+ospf6d=no
+isisd=no
+bfdd=no
+ldpd=no
+
+vtysh_enable=yes
+
+zebra_options="  -A 127.0.0.1 -s 67108864 -M dplane_fpm_nl"
+staticd_options="-A 127.0.0.1"
+
+log_file={{ .LogFile }}
+EOF
+~~~
+
+Kenapa?
+
+Karena tujuan fase ini adalah membuktikan:
+
+~~~
+PPPoE
++
+AAA
++
+IPv4 pool
+~~~
+
+Bukan membuktikan seluruh routing stack sekaligus.
+
+---
+
+# 17. Dataplane Template dan Masalah Process Lifecycle
+
+OSVBNG entrypoint menjalankan VPP kemudian mengecek apakah PID VPP masih hidup.
+
+Karena itu VPP harus berjalan sebagai foreground process.
+
+Bagian unix yang penting:
+
+~~~text
+unix {
+  nodaemon
+  log {{ .LogFile }}
+  full-coredump
+  cli-listen {{ .CLISocket }}
+  cli-prompt osvbng#
+  cli-no-pager
+}
+~~~
+
+## 17.1 Kenapa sebelumnya sempat gagal?
+
+Ketika konfigurasi hanya diubah dengan menghapus interactive tanpa menambahkan nodaemon, VPP dapat daemonize.
+
+Entrypoint menyimpan PID process awal:
+
+~~~
+VPP start
+   |
+   +-- PID disimpan
+   |
+   +-- entrypoint cek PID
+~~~
+
+Jika process yang disimpan sudah keluar karena daemonize:
+
+~~~
+PID awal hilang
+   |
+entrypoint menganggap VPP mati
+~~~
+
+Jadi solusi yang benar untuk lifecycle container bukan sekadar "hapus interactive", tetapi memastikan VPP tidak daemonize.
+
+---
+
+# 18. Start Container dan Pasang Interface
+
+Setelah semua file siap:
+
+~~~bash
+docker rm -f osvbng 2>/dev/null || true
+
+docker run -d \
+  --name osvbng \
+  --privileged \
+  --network none \
+  -v /opt/osvbng/osvbng.yaml:/etc/osvbng/osvbng.yaml:ro \
+  -v /opt/osvbng/dataplane.conf.tmpl:/usr/share/osvbng/templates/dataplane.conf.tmpl:ro \
+  -v /opt/osvbng/routing-daemons.tmpl:/usr/share/osvbng/templates/routing-daemons.tmpl:ro \
+  -e OSVBNG_WAIT_FOR_INTERFACES=true \
+  -e OSVBNG_ACCESS_INTERFACE=eth0 \
+  -e OSVBNG_CORE_INTERFACE=eth1 \
+  veesixnetworks/osvbng:latest
+~~~
+
+Kemudian:
+
+~~~bash
+./setup-interfaces.sh osvbng eth0:ens4 eth1:ens3
+~~~
+
+Monitor:
+
+~~~bash
+docker logs -f osvbng
+~~~
+
+---
+
+# 19. Output Startup yang Sehat
+
+Output yang dicari:
+
+~~~text
+All required interfaces are present
+Generating external configurations...
+Generated /etc/osvbng/dataplane.conf
+Generated /etc/osvbng/routing-daemons
+Generated /etc/osvbng/frr.conf
+Starting dataplane...
+Dataplane process running
+Dataplane API responsive
+Starting routing daemons...
+Status of zebra: running
+Status of staticd: running
+Starting osvbng...
+Configuration committed successfully
+Dataplane bootstrap complete
+API server listening on UDS
+osvbng started successfully
+~~~
+
+Kalau sampai:
+
+~~~text
+osvbng started successfully
+~~~
+
+maka startup BNG sudah berhasil.
+
+---
+
+# 20. Membuat User
+
+Masuk CLI:
+
+~~~bash
+docker exec -it osvbng osvbngcli
+~~~
+
+Buat:
+
+~~~text
+exec subscriber auth local users create --username user1 --password test --enabled true
+~~~
+
+Cek:
+
+~~~text
+show subscriber auth local users
+~~~
+
+---
+
+# 21. Konfigurasi MikroTik
+
+Buat VLAN:
+
+~~~routeros
+/interface vlan
+add name=vlan100 interface=ether1 vlan-id=100
+~~~
+
+Buat PPPoE:
+
+~~~routeros
+/interface pppoe-client
+add \
+    name=pppoe-test \
+    interface=vlan100 \
+    user=user1 \
+    password=test \
+    add-default-route=no \
+    dial-on-demand=no \
+    use-peer-dns=no \
+    disabled=no
+~~~
+
+Cek:
+
+~~~routeros
+/interface pppoe-client print detail
+~~~
+
+Monitor:
+
+~~~routeros
+/interface pppoe-client monitor pppoe-test
+~~~
+
+---
+
+# 22. Memverifikasi Session di BNG
+
+~~~bash
+docker exec -it osvbng osvbngcli
+~~~
+
+~~~text
+show subscriber sessions
+~~~
+
+Session yang berhasil diuji:
+
+~~~text
+State        active
+AccessType   pppoe
+Username     user1
+OuterVLAN    100
+InnerVLAN    0
+IfIndex      9
+AccessInterface
+VRF
+ServiceGroup residential
+IPv4Address  10.255.0.2
+IPv4Pool     subscriber-pool
+IPv4MTU      1452
+~~~
+
+Perhatikan bahwa session aktif berarti beberapa layer sudah bekerja sekaligus:
+
+~~~
+VLAN
+  |
+PPPoE discovery
+  |
+PPP session
+  |
+AAA
+  |
+IP allocation
+~~~
+
+---
+
+# 23. Common Issue: Tidak Ada Session
+
+Jika:
+
+~~~text
+show subscriber sessions
+No data
+~~~
+
+debug dari bawah ke atas.
+
+## Layer 1 / interface
+
+Host:
+
+~~~bash
+ip -br link
+~~~
+
+Container:
+
+~~~bash
+docker exec osvbng ip -br link
+~~~
+
+VPP:
+
+~~~bash
+docker exec osvbng \
+  vppctl -s /run/osvbng/cli.sock show interface
+~~~
+
+## Layer 2 / VLAN
+
+Pastikan MikroTik mengirim:
+
+~~~text
+VLAN 100
+~~~
+
+dan bukan:
+
+~~~text
+untagged
+~~~
+
+## PPPoE
+
+MikroTik:
+
+~~~routeros
+/interface pppoe-client monitor pppoe-test
+~~~
+
+## AAA
+
+OSVBNG:
+
+~~~text
+show subscriber auth local users
+~~~
+
+## Session
+
+~~~text
+show subscriber sessions
+~~~
+
+---
+
+# 24. Common Issue: VPP Mati karena OOM
+
+Ini adalah troubleshooting paling penting dari lab.
+
+Cek:
+
+~~~bash
+dmesg -T | grep -Ei 'oom|killed process|vpp'
+~~~
+
+Kalau terlihat:
+
+~~~text
+Out of memory: Killed process ... vpp_main
+~~~
+
+berarti Linux membunuh VPP.
+
+Cek:
+
+~~~bash
+free -h
+swapon --show
+grep -E 'HugePages_Total|HugePages_Free|MemAvailable' /proc/meminfo
+~~~
+
+Pada VM 2 GiB:
+
+- RAM terbatas,
+- hugepages 512 x 2 MiB = 1 GiB,
+- swap awal 0,
+- VPP/FRR/osvbngd tetap membutuhkan memory.
+
+Kombinasi itu dapat memicu OOM.
+
+Lab diperbaiki dengan:
+
+~~~bash
+echo 64 | sudo tee /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+~~~
+
+dan menambahkan swap ketika storage sudah diperbesar.
+
+---
+
+# 25. Common Issue: Disk Habis
+
+Jika:
+
+~~~bash
+df -h /
+~~~
+
+menunjukkan 100%, jangan lanjut debugging VPP dulu.
+
+Docker menyimpan data di:
+
+~~~text
+/var/lib/docker
+~~~
+
+VM GNS3 awal hanya sekitar 2.8 GB.
+
+Resize HDA di GNS3:
+
+~~~text
+Node properties
+  |
+  HDD
+  |
+  HDA
+  |
+  Resize
+  |
+  10000 MB
+~~~
+
+Setelah boot guest:
+
+~~~bash
+lsblk
+~~~
+
+Jika disk sudah besar tetapi sda1 belum:
+
+~~~bash
+sudo apt update
+sudo apt install -y cloud-guest-utils
+sudo growpart /dev/sda 1
+sudo resize2fs /dev/sda1
+df -h /
+~~~
+
+---
+
+# 26. Common Issue: Spam Kernel ICMP
+
+Gejala:
+
+~~~text
+icmp: detected local route for 10.0.0.2 during ICMP sending
+~~~
+
+Ini berasal dari kernel host.
+
+Untuk mengurangi output ke console:
+
+~~~bash
+sudo dmesg -n 3
+~~~
+
+Persist:
+
+~~~bash
+sudo tee /etc/sysctl.d/99-console-loglevel.conf >/dev/null <<'EOF'
+kernel.printk = 3 4 1 3
+EOF
+
+sudo sysctl --system
+~~~
+
+Ini tidak memperbaiki route. Ini hanya mengurangi pesan kernel yang tampil di console.
+
+---
+
+# 27. Common Issue: API Belum Muncul
+
+Cek:
+
+~~~bash
+docker exec osvbng ls -lah /run/osvbng/
+~~~
+
+Harus ada:
+
+~~~text
+api.sock
+cli.sock
+dataplane_api.sock
+~~~
+
+Cek:
+
+~~~bash
+docker exec osvbng ls -lah /run/osvbng/api.sock
+~~~
+
+Jika api.sock belum ada, lihat apakah log sudah sampai:
+
+~~~text
+API server listening on UDS
+~~~
+
+Jika belum, OSVBNG belum selesai startup.
+
+---
+
+# 28. Common Issue: FRR Warning
+
+Jika kita memang memakai routing-daemons minimal:
+
+~~~text
+bgpd is not running
+ospfd is not running
+ospf6d is not running
+ldpd is not running
+isisd is not running
+~~~
+
+warning tersebut expected.
+
+Jangan mengaktifkan semua daemon hanya untuk menghilangkan warning.
+
+Tunggu sampai roadmap mencapai:
+
+~~~text
+Core Routing
+BGP
+OSPF
+LDP/MPLS
+~~~
+
+baru hidupkan daemon yang diperlukan.
+
+---
+
+# 29. Common Issue: API Listener Salah Format
+
+Pada konfigurasi yang diuji, bentuk benar:
+
+~~~yaml
+listeners:
+  - address: ":8080"
+~~~
+
+Bukan:
+
+~~~yaml
+listeners:
+  - ":8080"
+~~~
+
+Jika salah struktur, configuration validation dapat gagal atau API tidak berjalan seperti yang diharapkan.
+
+---
+
+# 30. Validation Checklist
+
+Container:
+
+~~~bash
+docker ps --filter name=osvbng
+~~~
+
+VPP:
+
+~~~bash
+docker exec osvbng \
+  vppctl -s /run/osvbng/cli.sock show version
+
+docker exec osvbng \
+  vppctl -s /run/osvbng/cli.sock show interface
+~~~
+
+FRR:
+
+~~~bash
+docker exec osvbng \
+  ip netns exec dataplane \
+  /usr/lib/frr/frrinit.sh status
+~~~
+
+API:
+
+~~~bash
+docker exec osvbng \
+  ls -lah /run/osvbng/api.sock
+~~~
+
+Local auth:
+
+~~~text
+show subscriber auth local users
+~~~
+
+Subscriber:
+
+~~~text
+show subscriber sessions
+~~~
+
+Expected:
+
+~~~text
+state          active
+access-type    pppoe
+username       user1
+outer-vlan     100
+ipv4-address   10.255.0.2
+service-group  residential
+~~~
+
+---
+
+# 31. Progress
+
+~~~text
+[OK] OSVBNG startup
+[OK] VPP startup
+[OK] FRR minimal startup
+[OK] Docker namespace
+[OK] ACCESS interface
+[OK] CORE interface
+[OK] LCP
+[OK] Control-plane loopback
+[OK] Subscriber loopback
+[OK] IPv4 pool
+[OK] Local AAA
+[OK] PPPoE
+[OK] VLAN 100
+[OK] MikroTik PPPoE CPE
+[OK] IPv4 assignment
+[OK] Active subscriber session
+[OK] API UDS
+~~~
+
+# 32. Roadmap Berikutnya
+
+~~~text
+PPPoE + Local Auth
+        |
+        v
+RADIUS Authentication
+        |
+        v
+RADIUS Accounting
+        |
+        v
+CoA / Disconnect
+        |
+        v
+VLAN subscriber
+        |
+        v
+QinQ
+        |
+        v
+BGP / OSPF Core
+        |
+        v
+IPoE / DHCP
+        |
+        v
+QoS / Service Profile
+        |
+        v
+IPv6 / DHCPv6 / PD
+        |
+        v
+CGNAT
+        |
+        v
+HA / Session Recovery
+        |
+        v
+Production Hardening
+~~~
+
+Target berikutnya adalah RADIUS Authentication.
+
+Alur:
+
+~~~text
+PPPoE
+  |
+  v
+OSVBNG
+  |
+  | Access-Request
+  v
+RADIUS
+  |
+  | Access-Accept
+  | user + policy + attributes
+  v
+OSVBNG
+  |
+  v
+Subscriber Active
+~~~
+
+Kemudian:
+
+~~~text
+Accounting-Start
+Accounting-Interim
+Accounting-Stop
+CoA
+Disconnect-Request
+~~~
+
+> Dokumentasi ini adalah dokumentasi lab dan pembelajaran. Jangan menyalin konfigurasi ke production tanpa security review, resource sizing, monitoring, backup, failure testing, dan validasi terhadap versi OSVBNG/VPP/FRR yang digunakan.

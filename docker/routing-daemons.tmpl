@@ -1,0 +1,13 @@
+bgpd=no
+ospfd=no
+ospf6d=no
+isisd=no
+bfdd=no
+ldpd=no
+
+vtysh_enable=yes
+
+zebra_options="  -A 127.0.0.1 -s 67108864 -M dplane_fpm_nl"
+staticd_options="-A 127.0.0.1"
+
+log_file={{ .LogFile }}
